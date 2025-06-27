@@ -69,3 +69,57 @@ sudo -H pip3 install frappe-bench
 ```
 bench init frappe-bench --frappe-branch version-15
 ```
+
+```
+
+# Check Python version
+python --version
+ 
+# Verify installed pyenv versions
+pyenv versions
+ 
+# Edit shell configuration to load pyenv properly
+nano ~/.zshrc
+ 
+# Reload the shell configuration
+source ~/.zshrc
+ 
+# Confirm python command works after pyenv setup
+python --version
+ 
+# Initialize a new Frappe bench with version-15
+bench init frappe-bench --frappe-branch version-15
+ 
+# Attempt to start MariaDB (failed initially)
+brew services start mariadb
+ 
+# Install MariaDB via Homebrew
+brew install mariadb
+ 
+# Start the newly installed MariaDB service
+brew services start mariadb
+ 
+# Attempt to log in to MySQL (results in TLS/SSL error on newer MariaDB)
+mysql -u root
+ 
+# Switch to MariaDB 10.6 which is more stable for Frappe
+brew services restart mariadb@10.6
+ 
+# Retry MySQL login
+mysql -u root
+ 
+# Try sudo in case root access is required
+sudo mysql -u root
+ 
+# ✅ Inside MariaDB shell: Set root password and apply it
+ALTER USER 'root'@'localhost' IDENTIFIED BY 'your_password';
+FLUSH PRIVILEGES;
+exit;
+ 
+# Navigate into the bench directory
+cd frappe-bench
+ 
+# Create a new Frappe site
+bench new-site demo.local
+
+```
