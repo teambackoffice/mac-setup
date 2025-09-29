@@ -27,10 +27,10 @@ echo $PATH
 ```
 # Install Required Packages
 ```
-brew install python@3.10 git redis mariadb@10.6 node@14 yarn
+brew install python@3.10 git redis mariadb@10.6 node@18 yarn
 brew link --force python@3.10
 brew link --force mariadb@10.6
-brew link --force node@14
+brew link --force node@18
 ```
 # Configure MariaDB
 # Edit the MariaDB configuration file
