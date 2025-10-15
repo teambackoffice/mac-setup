@@ -98,6 +98,10 @@ brew install mariadb
  
 # Start the newly installed MariaDB service
 brew services start mariadb
+
+# load 
+source ~/.zshrc
+ 
  
 # Attempt to log in to MySQL (results in TLS/SSL error on newer MariaDB)
 mysql -u root
