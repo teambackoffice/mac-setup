@@ -1,0 +1,417 @@
+#!/bin/bash
+
+# =============================================================================
+# Frappe Bench Automatic Installation Script for macOS
+# Non-interactive version - no manual steps required
+# Idempotent: safe to re-run multiple times
+# =============================================================================
+
+set -euo pipefail
+
+# --- Colour helpers -----------------------------------------------------------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+err()  { echo -e "${RED}✗ $*${NC}" >&2; }
+ok()   { echo -e "${GREEN}✓ $*${NC}"; }
+skip() { echo -e "${CYAN}⊙ $* (already done, skipping)${NC}"; }
+info() { echo -e "\n${YELLOW}>>> $*${NC}\n"; }
+
+# =============================================================================
+# CONFIGURATION — edit these before running if you want specific values
+# =============================================================================
+MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-}"   # Set via env or prompted ONCE below
+FRAPPE_BRANCH="${FRAPPE_BRANCH:-version-15}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.10.15}"
+BENCH_DIR="${BENCH_DIR:-$HOME/frappe-bench}"
+NODE_VERSION="node@18"
+MARIADB_VERSION="mariadb@10.6"
+# =============================================================================
+
+echo ""
+echo "======================================"
+echo " Frappe Bench Auto-Installer (macOS) "
+echo "======================================"
+echo ""
+
+# macOS guard
+[[ "$OSTYPE" == darwin* ]] || { err "This script is for macOS only."; exit 1; }
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# Add a path permanently to ~/.zshrc (idempotent)
+add_to_zshrc() {
+    local marker="$1" line="$2"
+    grep -qF "$marker" ~/.zshrc 2>/dev/null || echo -e "\n$line" >> ~/.zshrc
+}
+
+# Source every relevant init so subsequent commands in THIS shell work
+reload_env() {
+    # Homebrew
+    [[ $(uname -m) == "arm64" ]] && eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true
+    # pyenv
+    if command_exists pyenv; then
+        export PYENV_ROOT="$HOME/.pyenv"
+        export PATH="$PYENV_ROOT/bin:$PATH"
+        eval "$(pyenv init --path)" 2>/dev/null || true
+        eval "$(pyenv init -)"      2>/dev/null || true
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# STEP 1 — Xcode Command Line Tools
+# ---------------------------------------------------------------------------
+info "Step 1: Xcode Command Line Tools"
+if xcode-select -p &>/dev/null; then
+    skip "Xcode CLT"
+else
+    # Headless install via softwareupdate.
+    # Apple occasionally changes the package label format across macOS releases,
+    # so we use multiple progressively-looser grep patterns rather than one
+    # brittle string. The first pattern that returns a result wins.
+    touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+    SU_LIST=$(softwareupdate -l 2>/dev/null)
+
+    PROD=""
+
+    # Pattern 1 — current format: "* Label: Command Line Tools for Xcode-16.x"
+    [[ -z "$PROD" ]] && PROD=$(echo "$SU_LIST" \
+        | grep -E "\*.*Label:.*Command Line Tools" \
+        | tail -1 \
+        | sed -E 's/.*Label: *//' \
+        | tr -d '\n')
+
+    # Pattern 2 — older format (pre-Ventura): "* Command Line Tools for Xcode ..."
+    [[ -z "$PROD" ]] && PROD=$(echo "$SU_LIST" \
+        | grep -E "\*.*Command Line Tools" \
+        | tail -1 \
+        | sed -E 's/^[[:space:]]*\*[[:space:]]*//' \
+        | tr -d '\n')
+
+    # Pattern 3 — broadest fallback: anything containing "CommandLineTools" or "CLTools"
+    [[ -z "$PROD" ]] && PROD=$(echo "$SU_LIST" \
+        | grep -iE "(CommandLineTools|CLTools|Command.Line.Tools)" \
+        | grep "\*" \
+        | tail -1 \
+        | sed -E 's/.*Label: *//' \
+        | sed -E 's/^[[:space:]]*\*[[:space:]]*//' \
+        | tr -d '\n')
+
+    rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+
+    if [[ -n "$PROD" ]]; then
+        echo "  Found package: $PROD"
+        softwareupdate -i "$PROD" --verbose
+        ok "Xcode CLT installed"
+    else
+        # Nothing matched — print the raw list to help diagnose future naming changes,
+        # then fall back to the GUI installer rather than hard-failing.
+        echo ""
+        echo -e "${YELLOW}  ⚠ Could not auto-detect CLT package name.${NC}"
+        echo "  Raw softwareupdate output (copy this if reporting an issue):"
+        echo "---"
+        echo "$SU_LIST"
+        echo "---"
+        echo ""
+        echo "  Falling back to GUI installer. A dialog will appear — click Install."
+        echo "  Once complete, re-run this script."
+        xcode-select --install 2>/dev/null || true
+        exit 0
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 2 — Homebrew
+# ---------------------------------------------------------------------------
+info "Step 2: Homebrew"
+if command_exists brew; then
+    skip "Homebrew"
+else
+    NONINTERACTIVE=1 /bin/bash -c \
+        "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    ok "Homebrew installed"
+fi
+
+# Ensure brew is in PATH for Apple Silicon
+if [[ $(uname -m) == "arm64" ]]; then
+    add_to_zshrc "brew shellenv" 'eval "$(/opt/homebrew/bin/brew shellenv)"'
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 3 — PATH configuration in ~/.zshrc
+# ---------------------------------------------------------------------------
+info "Step 3: ~/.zshrc PATH configuration"
+add_to_zshrc "opt/homebrew/bin"         'export PATH="/opt/homebrew/bin:$PATH"'
+add_to_zshrc "opt/homebrew/lib"         'export PATH="/opt/homebrew/lib:$PATH"'
+add_to_zshrc "opt/homebrew/opt/node@18" 'export PATH="/opt/homebrew/opt/node@18/bin:$PATH"'
+ok "~/.zshrc paths ensured"
+
+# ---------------------------------------------------------------------------
+# STEP 4 — Homebrew packages
+# ---------------------------------------------------------------------------
+info "Step 4: Installing Homebrew packages"
+PACKAGES=("python@3.10" "git" "redis" "$MARIADB_VERSION" "$NODE_VERSION" "yarn" "pyenv")
+for pkg in "${PACKAGES[@]}"; do
+    if brew list "$pkg" &>/dev/null; then
+        skip "$pkg"
+    else
+        echo "  Installing $pkg..."
+        brew install "$pkg"
+        ok "$pkg"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# STEP 5 — Force-link keg-only packages
+# ---------------------------------------------------------------------------
+info "Step 5: Linking keg-only packages"
+brew link --force --overwrite python@3.10    2>/dev/null || true
+brew link --force --overwrite "$MARIADB_VERSION" 2>/dev/null || true
+brew link --force --overwrite "$NODE_VERSION"    2>/dev/null || true
+ok "Packages linked"
+
+# ---------------------------------------------------------------------------
+# STEP 6 — MariaDB configuration file
+# ---------------------------------------------------------------------------
+info "Step 6: MariaDB my.cnf"
+MYCNF="/opt/homebrew/etc/my.cnf"
+if grep -q "utf8mb4_unicode_ci" "$MYCNF" 2>/dev/null; then
+    skip "my.cnf"
+else
+    cat > "$MYCNF" << 'EOF'
+[mysqld]
+character-set-client-handshake = FALSE
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+bind-address = 127.0.0.1
+
+[mysql]
+default-character-set = utf8mb4
+EOF
+    ok "my.cnf written"
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 7 — Start MariaDB (only start once; don't bounce if healthy)
+# ---------------------------------------------------------------------------
+info "Step 7: MariaDB service"
+if brew services list | awk '/mariadb/ {print $2}' | grep -q "started"; then
+    skip "MariaDB already running"
+else
+    brew services start "$MARIADB_VERSION"
+    ok "MariaDB started"
+fi
+echo "  Waiting for MariaDB to accept connections..."
+for i in {1..15}; do
+    mysql -u root --connect-timeout=2 -e "SELECT 1" &>/dev/null && break
+    mysql -u root -p"" --connect-timeout=2 -e "SELECT 1" &>/dev/null && break
+    sleep 1
+done
+
+# ---------------------------------------------------------------------------
+# STEP 8 — MariaDB root password  (NON-INTERACTIVE)
+# ---------------------------------------------------------------------------
+info "Step 8: MariaDB root password"
+
+# Helper: test a password (empty string = no password)
+mysql_test() {
+    local pw="$1"
+    if [[ -z "$pw" ]]; then
+        mysql -u root --connect-timeout=3 -e "SELECT 1" &>/dev/null
+    else
+        mysql -u root -p"${pw}" --connect-timeout=3 -e "SELECT 1" &>/dev/null
+    fi
+}
+
+FOUND_PASSWORD=""
+PASSWORD_NEEDS_SETTING=false
+
+if mysql_test ""; then
+    # Root has no password yet
+    PASSWORD_NEEDS_SETTING=true
+    FOUND_PASSWORD=""
+    echo "  Root account has no password."
+elif [[ -n "$MYSQL_ROOT_PASSWORD" ]] && mysql_test "$MYSQL_ROOT_PASSWORD"; then
+    # Caller supplied the correct password via environment
+    FOUND_PASSWORD="$MYSQL_ROOT_PASSWORD"
+    skip "MariaDB root password (env var MYSQL_ROOT_PASSWORD verified)"
+else
+    # Check common stored locations (bench-created .my.cnf)
+    STORED_CNF="$HOME/.my.cnf"
+    if [[ -f "$STORED_CNF" ]]; then
+        STORED_PW=$(awk -F= '/^password/{print $2}' "$STORED_CNF" | tr -d ' "' | head -1)
+        if mysql_test "$STORED_PW"; then
+            FOUND_PASSWORD="$STORED_PW"
+            skip "MariaDB root password (read from ~/.my.cnf)"
+        fi
+    fi
+
+    # Still not found — ask once (only interactive fallback in the entire script)
+    if [[ -z "$FOUND_PASSWORD" ]]; then
+        echo ""
+        echo -e "${YELLOW}  MariaDB root already has a password and it was not found automatically.${NC}"
+        echo "  You can avoid this prompt next time by running:"
+        echo "    MYSQL_ROOT_PASSWORD='yourpassword' bash $0"
+        echo ""
+        read -rsp "  Enter existing MariaDB root password: " MYSQL_ROOT_PASSWORD
+        echo ""
+        if mysql_test "$MYSQL_ROOT_PASSWORD"; then
+            FOUND_PASSWORD="$MYSQL_ROOT_PASSWORD"
+            ok "Password verified"
+        else
+            err "Incorrect password. Re-run with: MYSQL_ROOT_PASSWORD='...' bash $0"
+            exit 1
+        fi
+    fi
+fi
+
+# Set the password if MariaDB had none
+if [[ "$PASSWORD_NEEDS_SETTING" == true ]]; then
+    if [[ -z "$MYSQL_ROOT_PASSWORD" ]]; then
+        # Generate a secure random password — no prompt needed
+        MYSQL_ROOT_PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*' </dev/urandom | head -c 20)"
+        echo ""
+        echo -e "${YELLOW}  No password supplied. A secure password has been generated.${NC}"
+    fi
+    mysql -u root << SQL
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+FLUSH PRIVILEGES;
+SQL
+    FOUND_PASSWORD="$MYSQL_ROOT_PASSWORD"
+
+    # Persist to ~/.my.cnf so bench and this script can reuse it silently
+    cat > "$HOME/.my.cnf" << EOF
+[client]
+user=root
+password=${FOUND_PASSWORD}
+EOF
+    chmod 600 "$HOME/.my.cnf"
+    ok "MariaDB root password set and saved to ~/.my.cnf"
+fi
+
+echo ""
+echo -e "${GREEN}  ✓ MariaDB root password is set.${NC}"
+echo "    Save this for 'bench new-site': ${FOUND_PASSWORD}"
+echo ""
+
+# Export so bench-init can use it if needed
+export MYSQL_ROOT_PASSWORD="$FOUND_PASSWORD"
+
+# ---------------------------------------------------------------------------
+# STEP 9 — pyenv + Python 3.10
+# ---------------------------------------------------------------------------
+info "Step 9: pyenv + Python $PYTHON_VERSION"
+
+add_to_zshrc "PYENV_ROOT" \
+'export PYENV_ROOT="$HOME/.pyenv"
+export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init --path)"
+eval "$(pyenv init -)"'
+
+reload_env
+
+if pyenv versions 2>/dev/null | grep -q "${PYTHON_VERSION}"; then
+    skip "Python $PYTHON_VERSION"
+else
+    echo "  Building Python $PYTHON_VERSION (this takes a few minutes)..."
+    pyenv install "$PYTHON_VERSION"
+    ok "Python $PYTHON_VERSION installed"
+fi
+
+pyenv global "$PYTHON_VERSION"
+reload_env
+echo "  Active Python: $(python --version)"
+
+# ---------------------------------------------------------------------------
+# STEP 10 — Redis
+# ---------------------------------------------------------------------------
+info "Step 10: Redis"
+if brew services list | awk '/^redis /{print $2}' | grep -q "started"; then
+    skip "Redis"
+else
+    brew services start redis
+    ok "Redis started"
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 11 — frappe-bench pip package
+# ---------------------------------------------------------------------------
+info "Step 11: frappe-bench pip package"
+pip3 install --upgrade pip -q
+pip3 install --force-reinstall frappe-bench -q
+
+# Make sure bench is on PATH from pyenv shims
+reload_env
+if ! command_exists bench; then
+    python -m pip install frappe-bench -q
+fi
+command_exists bench && ok "bench $(bench --version)" || { err "bench not found after install"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# STEP 12 — bench init
+# ---------------------------------------------------------------------------
+info "Step 12: bench init ($FRAPPE_BRANCH)"
+if [[ -d "$BENCH_DIR" ]]; then
+    skip "bench init (directory $BENCH_DIR exists)"
+    cd "$BENCH_DIR"
+else
+    reload_env
+    PYTHON_PATH="$(pyenv which python)"
+    echo "  Python path : $PYTHON_PATH"
+    echo "  Bench dir   : $BENCH_DIR"
+    echo "  Branch      : $FRAPPE_BRANCH"
+    echo ""
+    echo "  Downloading Frappe and dependencies (may take several minutes)..."
+    cd ~
+    bench init "$BENCH_DIR" \
+        --frappe-branch "$FRAPPE_BRANCH" \
+        --python "$PYTHON_PATH" \
+        || { err "bench init failed. Check errors above."; exit 1; }
+    ok "bench init complete"
+    cd "$BENCH_DIR"
+fi
+
+[[ -d "$BENCH_DIR" ]] || { err "$BENCH_DIR missing after init"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# DONE
+# ---------------------------------------------------------------------------
+echo ""
+echo "======================================"
+echo -e "${GREEN} Installation Complete! ${NC}"
+echo "======================================"
+echo ""
+echo "  Bench location : $BENCH_DIR"
+echo "  Python         : $(python --version)"
+echo "  Bench version  : $(bench --version)"
+echo "  MariaDB root pw: $FOUND_PASSWORD"
+echo "  (also stored in ~/.my.cnf)"
+echo ""
+echo "======================================"
+echo " Next steps"
+echo "======================================"
+echo ""
+echo "  cd $BENCH_DIR"
+echo ""
+echo "  # Create a new site"
+echo "  bench new-site mysite.local"
+echo "  # (MariaDB root password is already in ~/.my.cnf — press Enter when prompted)"
+echo ""
+echo "  # Add hostname (one-time)"
+echo "  bench --site mysite.local add-to-hosts"
+echo ""
+echo "  # Start dev server"
+echo "  bench start"
+echo ""
+echo "  # Open in browser"
+echo "  http://mysite.local:8000"
+echo "  Login: Administrator / <password you set during new-site>"
+echo ""
+echo "======================================"
+echo " Useful commands"
+echo "======================================"
+echo "  bench new-site <name>.local"
+echo "  bench get-app erpnext --branch version-15"
+echo "  bench --site <name>.local install-app erpnext"
+echo "  bench --site <name>.local migrate"
+echo "  bench start"
+echo "======================================"
