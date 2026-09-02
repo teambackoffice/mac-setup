@@ -59,16 +59,25 @@ reload_env() {
 # ---------------------------------------------------------------------------
 # STEP 1 — Xcode Command Line Tools
 # ---------------------------------------------------------------------------
+# NOTE: This is the small "Command Line Tools" package, NOT the full Xcode.app.
+# It is a genuine, non-skippable requirement: it's where Homebrew and pyenv
+# (which compiles Python from source in Step 9) get their C compiler from.
+#
+# FIX vs. previous version: the pattern-matching lines below used to be
+#   [[ -z "$PROD" ]] && PROD=$(... | grep ... | ...)
+# Under `set -euo pipefail`, if the grep found no match, that assignment
+# (being the last command in the && list) was NOT exempt from `set -e`, so
+# the whole script would silently die right there — before ever trying the
+# other patterns or the GUI fallback. That's almost certainly why you had to
+# install Xcode by hand last time. Fixed below with `|| true` guards, plus
+# the GUI fallback now waits for you instead of requiring a manual re-run.
+# ---------------------------------------------------------------------------
 info "Step 1: Xcode Command Line Tools"
 if xcode-select -p &>/dev/null; then
     skip "Xcode CLT"
 else
-    # Headless install via softwareupdate.
-    # Apple occasionally changes the package label format across macOS releases,
-    # so we use multiple progressively-looser grep patterns rather than one
-    # brittle string. The first pattern that returns a result wins.
     touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
-    SU_LIST=$(softwareupdate -l 2>/dev/null)
+    SU_LIST=$(softwareupdate -l 2>/dev/null || true)
 
     PROD=""
 
@@ -77,14 +86,14 @@ else
         | grep -E "\*.*Label:.*Command Line Tools" \
         | tail -1 \
         | sed -E 's/.*Label: *//' \
-        | tr -d '\n')
+        | tr -d '\n') || true
 
     # Pattern 2 — older format (pre-Ventura): "* Command Line Tools for Xcode ..."
     [[ -z "$PROD" ]] && PROD=$(echo "$SU_LIST" \
         | grep -E "\*.*Command Line Tools" \
         | tail -1 \
         | sed -E 's/^[[:space:]]*\*[[:space:]]*//' \
-        | tr -d '\n')
+        | tr -d '\n') || true
 
     # Pattern 3 — broadest fallback: anything containing "CommandLineTools" or "CLTools"
     [[ -z "$PROD" ]] && PROD=$(echo "$SU_LIST" \
@@ -93,7 +102,7 @@ else
         | tail -1 \
         | sed -E 's/.*Label: *//' \
         | sed -E 's/^[[:space:]]*\*[[:space:]]*//' \
-        | tr -d '\n')
+        | tr -d '\n') || true
 
     rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
 
@@ -102,19 +111,35 @@ else
         softwareupdate -i "$PROD" --verbose
         ok "Xcode CLT installed"
     else
-        # Nothing matched — print the raw list to help diagnose future naming changes,
-        # then fall back to the GUI installer rather than hard-failing.
         echo ""
-        echo -e "${YELLOW}  ⚠ Could not auto-detect CLT package name.${NC}"
+        echo -e "${YELLOW}  ⚠ Could not auto-detect the CLT package name via softwareupdate.${NC}"
         echo "  Raw softwareupdate output (copy this if reporting an issue):"
         echo "---"
         echo "$SU_LIST"
         echo "---"
         echo ""
-        echo "  Falling back to GUI installer. A dialog will appear — click Install."
-        echo "  Once complete, re-run this script."
+        echo "  Falling back to the standard installer — a dialog will pop up, click 'Install'."
+        echo "  This script will WAIT for it to finish, so you don't need to re-run anything."
         xcode-select --install 2>/dev/null || true
-        exit 0
+
+        echo -n "  Waiting for install to complete (checks every 10s, up to ~30 min)"
+        CLT_READY=false
+        for _ in $(seq 1 180); do
+            if xcode-select -p &>/dev/null; then
+                CLT_READY=true
+                break
+            fi
+            echo -n "."
+            sleep 10
+        done
+        echo ""
+
+        if [[ "$CLT_READY" == true ]]; then
+            ok "Xcode CLT installed"
+        else
+            err "Timed out waiting for Xcode CLT. Finish the dialog install, then re-run this script."
+            exit 1
+        fi
     fi
 fi
 
@@ -377,7 +402,7 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "======================================"
-echo -e "${GREEN} Installation Complete! ${NC}"
+echo -e "${GREEN} Bench setup complete! ${NC}"
 echo "======================================"
 echo ""
 echo "  Bench location : $BENCH_DIR"
@@ -386,32 +411,6 @@ echo "  Bench version  : $(bench --version)"
 echo "  MariaDB root pw: $FOUND_PASSWORD"
 echo "  (also stored in ~/.my.cnf)"
 echo ""
-echo "======================================"
-echo " Next steps"
-echo "======================================"
-echo ""
-echo "  cd $BENCH_DIR"
-echo ""
-echo "  # Create a new site"
-echo "  bench new-site mysite.local"
-echo "  # (MariaDB root password is already in ~/.my.cnf — press Enter when prompted)"
-echo ""
-echo "  # Add hostname (one-time)"
-echo "  bench --site mysite.local add-to-hosts"
-echo ""
-echo "  # Start dev server"
-echo "  bench start"
-echo ""
-echo "  # Open in browser"
-echo "  http://mysite.local:8000"
-echo "  Login: Administrator / <password you set during new-site>"
-echo ""
-echo "======================================"
-echo " Useful commands"
-echo "======================================"
-echo "  bench new-site <name>.local"
-echo "  bench get-app erpnext --branch version-15"
-echo "  bench --site <name>.local install-app erpnext"
-echo "  bench --site <name>.local migrate"
-echo "  bench start"
+echo "  Site creation is a manual step from here — run 'bench new-site' yourself"
+echo "  once you're in $BENCH_DIR."
 echo "======================================"
